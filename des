@@ -39,7 +39,7 @@ XRAY_LOG="/var/log/des-xray.log"
 SELF="/usr/local/bin/des"
 DES_URL="${DES_URL:-https://raw.githubusercontent.com/stuinx/des/main/des}"
 GH_PROXY="${GH_PROXY:-}"
-GH_MIRRORS="${GH_MIRRORS:-https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/}"
+GH_MIRRORS="${GH_MIRRORS:-https://gh-proxy.com/ https://ghproxy.net/ https://ghfast.top/}"
 XRAY_VERSION="${XRAY_VERSION:-latest}"
 NFT_OK=""
 
@@ -173,13 +173,15 @@ pub_ipv4() {
   return 1
 }
 
-# gh_get URL 输出文件：直连 GitHub 失败时依次尝试镜像，成功的前缀记入 GH_PROXY
+# gh_get URL 输出文件 [progress]：直连 GitHub 失败时依次尝试镜像，成功的前缀记入 GH_PROXY
+# 下载速度低于 10KB/s 持续 15 秒即放弃当前源（国内直连 GitHub 常见“连上但不走数据”）
 gh_get() {
-  local u="$1" o="$2" p
+  local u="$1" o="$2" p q="-s"
+  [ "${3-}" = "progress" ] && [ -t 1 ] && q="-#"
   for p in ${GH_PROXY:-DIRECT} $GH_MIRRORS; do
     [ "$p" = "DIRECT" ] && p=""
-    if curl -fsSL --retry 2 --connect-timeout 8 --max-time 300 -o "$o" "$p$u" 2>/dev/null && [ -s "$o" ]; then
-      [ -n "$p" ] && [ "$p" != "$GH_PROXY" ] && info "使用 GitHub 镜像 $p"
+    [ -n "$p" ] && [ "$q" = "-#" ] && info "尝试 GitHub 镜像 $p"
+    if curl -fSL $q --connect-timeout 8 --speed-limit 10240 --speed-time 15 --max-time 600 -o "$o" "$p$u" 2>/dev/null && [ -s "$o" ]; then
       GH_PROXY="$p"
       return 0
     fi
@@ -302,7 +304,7 @@ install_xray() {
       u="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/$z"
     fi
     info "下载 Xray ($XRAY_VERSION / $a) ..."
-    gh_get "$u" "$tmp/x.zip" || { rm -rf "$tmp"; err "Xray 下载失败（可把 $z 上传到 /root/ 离线安装）"; return 1; }
+    gh_get "$u" "$tmp/x.zip" progress || { rm -rf "$tmp"; err "Xray 下载失败（可把 $z 上传到 /root/ 离线安装）"; return 1; }
     dg=""
     gh_get "$u.dgst" "$tmp/x.dgst" && dg=$(awk -F'= *' '/^SHA2-256/{print $2; exit}' "$tmp/x.dgst" | tr -d '\r ')
   fi
