@@ -25,7 +25,15 @@ chmod +x /usr/local/bin/des && des
 ```
 
 - 也可以 scp 上传 `des` 后执行 `sh des`，安装时脚本会把自己复制到 `/usr/local/bin/des`。
-- GitHub 连接不畅时，可以设置 `GH_PROXY=https://ghproxy.net/ des`，或把 `Xray-linux-64.zip` 先放到 `/root/` 离线安装。
+- 访问不了 `raw.githubusercontent.com`（`curl: (35) Connection reset`）时，换用镜像下载脚本：
+
+  ```sh
+  curl -fsSL https://cdn.jsdelivr.net/gh/stuinx/des@main/des -o /usr/local/bin/des
+  # 或
+  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/stuinx/des/main/des -o /usr/local/bin/des
+  ```
+
+  下载 Xray 和更新脚本时，直连 GitHub 失败会自动依次尝试 `ghfast.top`、`gh-proxy.com`、`ghproxy.net`。也可以手动指定：`GH_PROXY=https://ghfast.top/ des`。还可以把 `Xray-linux-64.zip` 先放到 `/root/` 离线安装。
 - `des update` 默认从本仓库 main 分支更新，可用环境变量 `DES_URL` 覆盖。
 
 ## 证书

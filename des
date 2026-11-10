@@ -21,7 +21,7 @@
 #   des uninstall          卸载
 #
 # 环境变量：
-#   GH_PROXY=https://ghproxy.net/   GitHub 下载代理前缀（可选）
+#   GH_PROXY=https://ghfast.top/    GitHub 下载代理前缀（可选；直连失败时会自动尝试内置镜像）
 #   XRAY_VERSION=v26.x.x            指定 Xray 版本（默认 latest）
 #   DES_URL=<raw 地址>              des 脚本更新地址
 #   也可把 Xray-linux-<arch>.zip 预先放到 /root/ 离线安装
@@ -39,6 +39,7 @@ XRAY_LOG="/var/log/des-xray.log"
 SELF="/usr/local/bin/des"
 DES_URL="${DES_URL:-https://raw.githubusercontent.com/stuinx/des/main/des}"
 GH_PROXY="${GH_PROXY:-}"
+GH_MIRRORS="${GH_MIRRORS:-https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/}"
 XRAY_VERSION="${XRAY_VERSION:-latest}"
 NFT_OK=""
 
@@ -172,6 +173,21 @@ pub_ipv4() {
   return 1
 }
 
+# gh_get URL 输出文件：直连 GitHub 失败时依次尝试镜像，成功的前缀记入 GH_PROXY
+gh_get() {
+  local u="$1" o="$2" p
+  for p in ${GH_PROXY:-DIRECT} $GH_MIRRORS; do
+    [ "$p" = "DIRECT" ] && p=""
+    if curl -fsSL --retry 2 --connect-timeout 8 --max-time 300 -o "$o" "$p$u" 2>/dev/null && [ -s "$o" ]; then
+      [ -n "$p" ] && [ "$p" != "$GH_PROXY" ] && info "使用 GitHub 镜像 $p"
+      GH_PROXY="$p"
+      return 0
+    fi
+  done
+  rm -f "$o"
+  return 1
+}
+
 resolve4() {
   local r
   is_ipv4 "$1" && { echo "$1"; return 0; }
@@ -286,8 +302,9 @@ install_xray() {
       u="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/$z"
     fi
     info "下载 Xray ($XRAY_VERSION / $a) ..."
-    curl -fL --retry 3 --connect-timeout 10 -o "$tmp/x.zip" "${GH_PROXY}$u" || { rm -rf "$tmp"; err "Xray 下载失败"; return 1; }
-    dg=$(curl -fsL --retry 3 --connect-timeout 10 "${GH_PROXY}$u.dgst" 2>/dev/null | awk -F'= *' '/^SHA2-256/{print $2; exit}' | tr -d '\r ')
+    gh_get "$u" "$tmp/x.zip" || { rm -rf "$tmp"; err "Xray 下载失败（可把 $z 上传到 /root/ 离线安装）"; return 1; }
+    dg=""
+    gh_get "$u.dgst" "$tmp/x.dgst" && dg=$(awk -F'= *' '/^SHA2-256/{print $2; exit}' "$tmp/x.dgst" | tr -d '\r ')
   fi
   if [ -n "$dg" ]; then
     s=$(sha256sum "$tmp/x.zip" | awk '{print $1}')
@@ -394,14 +411,14 @@ install_self() {
   if [ -f "$src" ] && head -n1 "$src" 2>/dev/null | grep -q '^#!/bin/sh'; then
     [ "$src" = "$SELF" ] || cp -f "$src" "$SELF"
   else
-    curl -fsL "${GH_PROXY}$DES_URL" -o "$SELF" || warn "未能安装 $SELF，请手动下载"
+    gh_get "$DES_URL" "$SELF" || warn "未能安装 $SELF，请手动下载"
   fi
   chmod 755 "$SELF" 2>/dev/null
   return 0
 }
 
 cmd_selfupdate() {
-  curl -fsL "${GH_PROXY}$DES_URL" -o "$SELF.new" || { err "下载失败（可设置 DES_URL）"; return 1; }
+  gh_get "$DES_URL" "$SELF.new" || { err "下载失败（可设置 DES_URL / GH_PROXY）"; return 1; }
   if head -n1 "$SELF.new" | grep -q '^#!/bin/sh' && sh -n "$SELF.new"; then
     chmod 755 "$SELF.new" && mv -f "$SELF.new" "$SELF"
     ok "des 已更新到 $(awk -F'"' '/^VERSION=/{print $2; exit}' "$SELF")"
