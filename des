@@ -1,6 +1,6 @@
 #!/bin/sh
-# des: 独立的 Alpine 精简落地 / 中转脚本，可与 de_GWD client 配合使用
-# 针对 Alpine / OpenRC / 128MB NAT LXC
+# des: 独立的轻量落地 / 中转脚本，可与 de_GWD client 配合使用
+# 支持 Alpine（OpenRC）与 Debian / Ubuntu（systemd），针对 128MB NAT LXC / VPS 优化
 #
 #   落地：VLESS + XHTTP + TLS 主线节点（de_GWD client 可直连）
 #         + 55 附加协议（Reality + Vision / SOCKS5）
@@ -15,7 +15,7 @@
 #   des node               打印节点信息
 #   des status             运行状态
 #   des apply              按状态文件重建配置并重启服务
-#   des refresh            刷新 nft 域名目标解析 + 日志截断（crond 每 5 分钟调用）
+#   des refresh            刷新 nft 域名目标解析 + 日志截断（每 5 分钟由 crond / systemd timer 调用）
 #   des update-xray        更新 Xray 核心
 #   des update             更新 des 脚本
 #   des uninstall          卸载
@@ -42,6 +42,8 @@ GH_PROXY="${GH_PROXY:-}"
 GH_MIRRORS="${GH_MIRRORS:-https://gh-proxy.com/ https://ghproxy.net/ https://ghfast.top/}"
 XRAY_VERSION="${XRAY_VERSION:-latest}"
 NFT_OK=""
+OS_PKG=""
+OS_INIT=""
 
 if [ -t 1 ]; then
   R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[36m'; W='\033[1m'; N='\033[0m'
@@ -123,10 +125,33 @@ txn_commit() {
 
 # ---------------------------------------------------------------- 环境
 
+detect_os() {
+  if command -v apk >/dev/null 2>&1; then OS_PKG="apk"
+  elif command -v apt-get >/dev/null 2>&1; then OS_PKG="apt"
+  else return 1; fi
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then OS_INIT="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then OS_INIT="openrc"
+  else return 1; fi
+  return 0
+}
+
 check_env() {
   [ "$(id -u)" = "0" ] || die "需要 root 权限"
-  command -v apk >/dev/null 2>&1 || die "本脚本仅支持 Alpine Linux"
-  command -v rc-service >/dev/null 2>&1 || die "未检测到 OpenRC（rc-service）"
+  detect_os || die "仅支持 Alpine（OpenRC）与 Debian / Ubuntu（systemd）"
+}
+
+# pkg_install 包名 ...
+pkg_install() {
+  # shellcheck disable=SC2086
+  case "$OS_PKG" in
+    apk)
+      apk add --no-cache "$@" >/dev/null 2>&1 || { apk update >/dev/null 2>&1; apk add --no-cache "$@" >/dev/null 2>&1; } ;;
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get install -y -q --no-install-recommends "$@" >/dev/null 2>&1 \
+        || { apt-get update -q >/dev/null 2>&1; apt-get install -y -q --no-install-recommends "$@" >/dev/null 2>&1; } ;;
+    *) return 1 ;;
+  esac
 }
 
 # need_pkgs 命令:包名 ...
@@ -139,8 +164,7 @@ need_pkgs() {
   [ -z "$m" ] && return 0
   info "安装依赖:$m"
   # shellcheck disable=SC2086
-  apk add --no-cache $m >/dev/null 2>&1 || { apk update >/dev/null 2>&1; apk add --no-cache $m >/dev/null 2>&1; } \
-    || die "依赖安装失败:$m"
+  pkg_install $m || die "依赖安装失败:$m"
 }
 
 mem_mb() {
@@ -193,7 +217,8 @@ gh_get() {
 resolve4() {
   local r
   is_ipv4 "$1" && { echo "$1"; return 0; }
-  r=$(getent hosts "$1" 2>/dev/null | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
+  r=$(getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
+  [ -z "$r" ] && r=$(getent hosts "$1" 2>/dev/null | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
   [ -z "$r" ] && r=$(nslookup "$1" 2>/dev/null | awk '/^Name:/{f=1} f' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
   [ -n "$r" ] && { echo "$r"; return 0; }
   return 1
@@ -250,9 +275,47 @@ ask_proto() {
 
 new_uuid() { "$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
 
-svc_running() { rc-service "$1" status >/dev/null 2>&1; }
+# 服务抽象：OpenRC / systemd（systemd 单元名可带 .timer 后缀）
+svc_exists() {
+  case "$OS_INIT" in
+    openrc) [ -f "/etc/init.d/$1" ] ;;
+    *) case "$1" in *.*) [ -f "/etc/systemd/system/$1" ] ;; *) [ -f "/etc/systemd/system/$1.service" ] ;; esac ;;
+  esac
+}
+svc_running() {
+  case "$OS_INIT" in
+    openrc) rc-service "$1" status >/dev/null 2>&1 ;;
+    *) systemctl is-active --quiet "$1" 2>/dev/null ;;
+  esac
+}
+svc_do() { # svc_do start|stop|restart|reload 服务
+  case "$OS_INIT" in
+    openrc) rc-service "$2" "$1" >/dev/null 2>&1 ;;
+    *) systemctl "$1" "$2" >/dev/null 2>&1 ;;
+  esac
+}
+svc_enable() {
+  case "$OS_INIT" in
+    openrc) rc-update add "$1" default >/dev/null 2>&1 ;;
+    *) systemctl enable "$1" >/dev/null 2>&1 ;;
+  esac
+}
+svc_disable() {
+  case "$OS_INIT" in
+    openrc) rc-update del "$1" default >/dev/null 2>&1 ;;
+    *) systemctl disable "$1" >/dev/null 2>&1 ;;
+  esac
+}
+xray_log_tail() {
+  case "$OS_INIT" in
+    openrc) tail -n "${1:-5}" "$XRAY_LOG" 2>/dev/null ;;
+    *) journalctl -u des-xray -n "${1:-5}" --no-pager 2>/dev/null ;;
+  esac
+}
+refresh_unit() { if [ "$OS_INIT" = "openrc" ]; then echo crond; else echo des-refresh.timer; fi; }
+
 svc_state() {
-  if [ ! -f "/etc/init.d/$1" ]; then printf '%b' "${W}-${N}"
+  if ! svc_exists "$1"; then printf '%b' "${W}-${N}"
   elif svc_running "$1"; then printf '%b' "${G}运行中${N}"
   else printf '%b' "${R}停止${N}"; fi
 }
@@ -264,7 +327,7 @@ addr_of() { if [ "$2" = "443" ]; then echo "$1"; else echo "$1:$2"; fi; }
 nft_usable() {
   [ -n "$NFT_OK" ] && { [ "$NFT_OK" = "1" ]; return; }
   NFT_OK=0
-  command -v nft >/dev/null 2>&1 || apk add --no-cache nftables >/dev/null 2>&1 || return 1
+  command -v nft >/dev/null 2>&1 || pkg_install nftables || return 1
   nft add table ip des_probe 2>/dev/null || return 1
   if ! nft add chain ip des_probe p '{ type nat hook prerouting priority -100; }' 2>/dev/null; then
     nft delete table ip des_probe 2>/dev/null; return 1
@@ -292,6 +355,7 @@ xray_arch() {
 install_xray() {
   local a z u dg s tmp
   a=$(xray_arch); z="Xray-linux-$a.zip"
+  need_pkgs unzip:unzip
   # 用磁盘临时目录，避免 /tmp 为 tmpfs 时占用 128MB 内存
   tmp="$BASE/.tmp"; rm -rf "$tmp"; mkdir -p "$tmp"
   if [ -f "/root/$z" ]; then
@@ -329,13 +393,85 @@ install_xray() {
 
 cmd_update_xray() {
   install_xray || return 1
-  svc_running des-xray && rc-service des-xray restart >/dev/null 2>&1
+  svc_running des-xray && svc_do restart des-xray
   return 0
 }
 
-# ---------------------------------------------------------------- OpenRC 服务
+# ---------------------------------------------------------------- 服务文件
 
 write_services() {
+  if [ "$OS_INIT" = "systemd" ]; then write_services_systemd; else write_services_openrc; fi
+}
+
+write_services_systemd() {
+  local hn
+  hn=$(ulimit -Hn 2>/dev/null)
+  case "$hn" in unlimited) hn=65535 ;; ''|*[!0-9]*) hn=4096 ;; esac
+  [ "$hn" -gt 65535 ] && hn=65535
+
+  cat >/etc/systemd/system/des-xray.service <<EOF
+[Unit]
+Description=des Xray
+After=network-online.target nss-lookup.target des-nft.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# GOMEMLIMIT 由 des 按内存上限自动生成（物理内存 / cgroup 上限的 35%）
+Environment=GOMEMLIMIT=$(gomemlimit) GOGC=50
+ExecStartPre=$XRAY_BIN run -test -c $XRAY_CONF
+ExecStart=$XRAY_BIN run -c $XRAY_CONF
+Restart=always
+RestartSec=3
+LimitNOFILE=$hn
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat >/etc/systemd/system/des-nft.service <<EOF
+[Unit]
+Description=des nftables port forward
+After=network-online.target
+Wants=network-online.target
+Before=des-xray.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/bin/sh -c 'sysctl -w net.ipv4.ip_forward=1'
+ExecStart=/bin/sh -c 'nft -f $NFT_CONF'
+ExecReload=/bin/sh -c 'nft -f $NFT_CONF'
+ExecStop=-/bin/sh -c 'nft delete table ip des'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat >/etc/systemd/system/des-refresh.service <<EOF
+[Unit]
+Description=des refresh (nft target re-resolve)
+
+[Service]
+Type=oneshot
+ExecStart=$SELF refresh
+EOF
+
+  cat >/etc/systemd/system/des-refresh.timer <<EOF
+[Unit]
+Description=des refresh every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+}
+
+write_services_openrc() {
   local hn
   hn=$(ulimit -Hn 2>/dev/null)
   case "$hn" in unlimited) hn=65535 ;; ''|*[!0-9]*) hn=4096 ;; esac
@@ -400,10 +536,14 @@ EOF
 }
 
 setup_cron() {
+  if [ "$OS_INIT" = "systemd" ]; then
+    systemctl enable --now des-refresh.timer >/dev/null 2>&1
+    return 0
+  fi
   touch /etc/crontabs/root
   grep -qF "$SELF refresh" /etc/crontabs/root || echo "*/5 * * * * $SELF refresh >/dev/null 2>&1" >>/etc/crontabs/root
-  rc-update add crond default >/dev/null 2>&1
-  svc_running crond || rc-service crond start >/dev/null 2>&1
+  svc_enable crond
+  svc_running crond || svc_do start crond
   return 0
 }
 
@@ -494,7 +634,7 @@ cmd_cert() {
     for d in $(st_get '.domain') $(st_get '.relay.rproxys.domain'); do
       cert_covers "$CERT" "$d" || warn "新证书不覆盖已配置的域名 $d"
     done
-    svc_running des-xray && rc-service des-xray restart >/dev/null 2>&1
+    svc_running des-xray && svc_do restart des-xray
   fi
   ok "证书已导入 $CERT"
 }
@@ -593,17 +733,17 @@ apply() {
     fi
     [ -f "$XRAY_CONF" ] && cp -f "$XRAY_CONF" "$XRAY_CONF.bak"
     mv -f "$XRAY_CONF.new" "$XRAY_CONF"; chmod 600 "$XRAY_CONF"
-    rc-update add des-xray default >/dev/null 2>&1
-    rc-service des-xray restart >/dev/null 2>&1 || rc-service des-xray start >/dev/null 2>&1
+    svc_enable des-xray
+    svc_do restart des-xray || svc_do start des-xray
     if ! xray_alive; then
-      err "Xray 启动失败，查看 $XRAY_LOG"; tail -n 5 "$XRAY_LOG" 2>/dev/null >&2
-      if [ -f "$XRAY_CONF.bak" ]; then mv -f "$XRAY_CONF.bak" "$XRAY_CONF"; rc-service des-xray restart >/dev/null 2>&1; fi
+      err "Xray 启动失败："; xray_log_tail 8 >&2
+      if [ -f "$XRAY_CONF.bak" ]; then mv -f "$XRAY_CONF.bak" "$XRAY_CONF"; svc_do restart des-xray; fi
       return 1
     fi
   else
     rm -f "$XRAY_CONF.new"
-    rc-service des-xray stop >/dev/null 2>&1
-    rc-update del des-xray default >/dev/null 2>&1
+    svc_do stop des-xray
+    svc_disable des-xray
   fi
 
   # --- nftables（中转）
@@ -617,14 +757,14 @@ apply() {
         fi
         mv -f "$NFT_CONF.new" "$NFT_CONF"
         echo "net.ipv4.ip_forward = 1" >/etc/sysctl.d/99-des.conf
-        rc-update add des-nft default >/dev/null 2>&1
+        svc_enable des-nft
         if svc_running des-nft; then nft -f "$NFT_CONF" || return 1
-        else rc-service des-nft start >/dev/null 2>&1 || { err "nft 规则加载失败"; return 1; }; fi
+        else svc_do start des-nft || { err "nft 规则加载失败"; return 1; }; fi
         ;;
       3)
         rm -f "$NFT_CONF.new" "$NFT_CONF"
-        rc-service des-nft stop >/dev/null 2>&1
-        rc-update del des-nft default >/dev/null 2>&1
+        svc_do stop des-nft
+        svc_disable des-nft
         nft delete table ip des >/dev/null 2>&1
         ;;
       *) rm -f "$NFT_CONF.new"; return 1 ;;
@@ -634,8 +774,8 @@ apply() {
 }
 
 stop_all() {
-  rc-service des-xray stop >/dev/null 2>&1
-  rc-service des-nft stop >/dev/null 2>&1
+  svc_do stop des-xray
+  svc_do stop des-nft
   nft delete table ip des >/dev/null 2>&1
   return 0
 }
@@ -700,6 +840,7 @@ cmd_install() {
   local r
   check_env
   need_pkgs curl:curl jq:jq openssl:openssl
+  [ "$OS_PKG" = "apt" ] && need_pkgs pgrep:procps ss:iproute2
   if [ -f "$STATE" ]; then
     warn "已存在配置（角色: $(st_get '.role')）"
     confirm "重新安装将覆盖现有节点配置，继续?" || return 0
@@ -731,11 +872,14 @@ cmd_install() {
 cmd_uninstall() {
   local s
   confirm "确认卸载 des（删除配置、Xray 与证书）?" || return 0
-  for s in des-xray des-nft; do
-    rc-service "$s" stop >/dev/null 2>&1
-    rc-update del "$s" default >/dev/null 2>&1
-    rm -f "/etc/init.d/$s" "/etc/conf.d/$s"
+  for s in des-xray des-nft des-refresh.timer; do
+    svc_do stop "$s"
+    svc_disable "$s"
   done
+  rm -f /etc/init.d/des-xray /etc/conf.d/des-xray /etc/init.d/des-nft \
+    /etc/systemd/system/des-xray.service /etc/systemd/system/des-nft.service \
+    /etc/systemd/system/des-refresh.service /etc/systemd/system/des-refresh.timer
+  [ "$OS_INIT" = "systemd" ] && systemctl daemon-reload
   nft delete table ip des >/dev/null 2>&1
   sed -i "\#$SELF refresh#d" /etc/crontabs/root 2>/dev/null
   rm -rf "$BASE" "$XRAY_BIN" "$XRAY_LOG" /etc/sysctl.d/99-des.conf
@@ -1035,8 +1179,9 @@ cmd_status() {
   role=$(st_get '.role')
   line
   say "des $VERSION    角色: ${Y}${role:-未安装}${N}    Xray: $("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')"
-  say "des-xray: $(svc_state des-xray) ($(rss_mb xray)MB)    des-nft: $(svc_state des-nft)    crond: $(svc_state crond)"
-  say "内存上限: $(mem_mb)MB    GOMEMLIMIT: $(awk -F'"' '/^GOMEMLIMIT=/{print $2}' /etc/conf.d/des-xray 2>/dev/null)"
+  say "系统: $OS_PKG / $OS_INIT"
+  say "des-xray: $(svc_state des-xray) ($(rss_mb xray)MB)    des-nft: $(svc_state des-nft)    定时刷新: $(svc_state "$(refresh_unit)")"
+  say "内存上限: $(mem_mb)MB    GOMEMLIMIT: $(grep -ho 'GOMEMLIMIT=[^ ]*' /etc/conf.d/des-xray /etc/systemd/system/des-xray.service 2>/dev/null | head -n1 | cut -d= -f2 | tr -d '"')"
   free -m 2>/dev/null | awk 'NR<=2'
   [ -s "$CERT" ] && say "证书: $(cert_sans "$CERT" | tr '\n' ' ')  到期 $(cert_end "$CERT")"
   line
@@ -1102,6 +1247,7 @@ menu() {
 }
 
 main() {
+  detect_os
   case "${1-}" in
     refresh)      cmd_refresh ;;
     node)         cmd_node ;;

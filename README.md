@@ -1,6 +1,11 @@
 # des
 
-`des` 是一个独立的轻量落地 / 中转脚本，适用于 **128MB 内存 / 1GB 硬盘 / NAT IPv4 的 Alpine LXC**。整个项目是一个 POSIX sh 脚本，服务由 OpenRC 管理，可以配合 de_GWD client 使用。
+`des` 是一个独立的轻量落地 / 中转脚本，适用于 **128MB 内存 / NAT IPv4 的 LXC / VPS**，可以配合 de_GWD client 使用。整个项目是一个 POSIX sh 脚本，支持以下系统：
+
+| 系统 | 包管理 | 服务管理 | 定时刷新 | Xray 日志 |
+| --- | --- | --- | --- | --- |
+| Alpine | apk | OpenRC | crond | `/var/log/des-xray.log` |
+| Debian / Ubuntu | apt | systemd | `des-refresh.timer` | `journalctl -u des-xray` |
 
 每台机器只承担一种角色：
 
@@ -14,12 +19,13 @@
 - Xray 按内存上限自动设置 `GOMEMLIMIT`（128MB 约 44MiB），只解压 `xray` 一个文件，不下载 geodata。安装包的下载和解压放在磁盘上，避免 tmpfs 挤占内存。
 - 端口转发参考 singbox-lite：能用 nftables 时走内核 DNAT，否则降级为 Xray 用户态（`dokodemo-door`）。域名目标由 crond 每 5 分钟重新解析一次。
 - 所有修改先写入 `/etc/des/state.json`，再重新生成配置。配置要先通过 `xray -test` 和 `nft -c` 校验才会替换，失败时自动回滚。
-- 依赖：`curl jq openssl ca-certificates`（中转可用时还会装 `nftables`）。
+- 依赖：`curl jq openssl ca-certificates unzip`；Debian 还需要 `procps iproute2`；中转如果能用 nftables，还会安装 `nftables`。
 
 ## 安装
 
 ```sh
-apk add curl
+apk add curl            # Alpine
+apt-get install -y curl # Debian / Ubuntu
 curl -fsSL https://raw.githubusercontent.com/stuinx/des/main/des -o /usr/local/bin/des
 chmod +x /usr/local/bin/des && des
 ```
@@ -129,11 +135,12 @@ des uninstall    卸载
 | `/etc/des/xray.json` | 自动生成的 Xray 配置 |
 | `/etc/des/nft.conf` | 自动生成的 nft 规则（`table ip des`） |
 | `/etc/des/ssl/` | 导入的证书 |
-| `/etc/init.d/des-xray`、`/etc/init.d/des-nft` | OpenRC 服务 |
-| `/var/log/des-xray.log` | Xray 日志（warning 级别，超过 1MB 自动清空） |
+| `/etc/init.d/des-xray`、`/etc/init.d/des-nft` | OpenRC 服务（Alpine） |
+| `/etc/systemd/system/des-{xray,nft,refresh}.*` | systemd 单元（Debian / Ubuntu） |
+| `/var/log/des-xray.log` | Alpine 上的 Xray 日志（warning 级别，超过 1MB 自动清空） |
 
 ## 限制
 
 - 仅支持 IPv4 目标，不包含 Web UI、WARP、内核优化和 DoH。
 - 落地默认屏蔽访问内网 IP 字面量，防止被当作内网跳板。
-- 如果 Alpine 自带的 `nftables` 服务启用了 `forward drop` 规则，会拦截 nft 转发，需要自行放行。
+- 如果系统自带的 `nftables` 服务启用了 `forward drop` 规则，会拦截 nft 转发，需要自行放行。
