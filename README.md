@@ -39,7 +39,25 @@ chmod +x /usr/local/bin/des && des
   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/stuinx/des/main/des -o /usr/local/bin/des
   ```
 
-  下载 Xray 和更新脚本时，直连 GitHub 失败会自动依次尝试 `ghfast.top`、`gh-proxy.com`、`ghproxy.net`。也可以手动指定：`GH_PROXY=https://ghfast.top/ des`。还可以把 `Xray-linux-64.zip` 先放到 `/root/` 离线安装。
+  更新脚本时，直连 GitHub 失败会自动依次尝试 `gh-proxy.com`、`ghproxy.net`、`ghfast.top`。也可以手动指定：`GH_PROXY=https://gh-proxy.com/ des`。
+
+### Xray 离线包（优先）
+
+安装时**优先使用本地离线包**，找不到才在线下载（先直连 GitHub，再走镜像）。查找顺序如下：
+
+1. 环境变量 `XRAY_ZIP=/path/Xray-linux-64.zip`
+2. 脚本所在目录、当前目录、`/root`、`/tmp` 下的 `Xray-linux-<arch>.zip`（x86_64 为 `64`，arm64 为 `arm64-v8a`）
+3. 上述目录下已解压的 `xray` 二进制
+
+如果同目录下有 `Xray-linux-<arch>.zip.dgst`，会自动校验 SHA256。在能访问 GitHub 的电脑上下载后上传：
+
+```sh
+curl -LO https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+curl -LO https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip.dgst
+scp -P <SSH端口> Xray-linux-64.zip Xray-linux-64.zip.dgst root@<主机>:/root/
+```
+
+更新时：`des update-xray /root/Xray-linux-64.zip` 使用离线包；不带参数则在线下载。菜单中的 `0` 有离线包时用离线包，没有就在线下载。
 - `des update` 默认从本仓库 main 分支更新，可用环境变量 `DES_URL` 覆盖。
 
 ## 证书
@@ -120,7 +138,7 @@ des node         打印节点信息
 des status       服务、内存、证书状态
 des cert C K     导入证书
 des apply        按状态文件重建配置
-des update-xray  更新 Xray（新核心先用现有配置测试，不兼容则放弃）
+des update-xray [ZIP]  更新 Xray（带参数用离线包；新核心先用现有配置测试，不兼容则放弃）
 des update       更新 des 脚本
 des uninstall    卸载
 ```

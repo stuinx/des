@@ -16,7 +16,7 @@
 #   des status             运行状态
 #   des apply              按状态文件重建配置并重启服务
 #   des refresh            刷新 nft 域名目标解析 + 日志截断（每 5 分钟由 crond / systemd timer 调用）
-#   des update-xray        更新 Xray 核心
+#   des update-xray [ZIP]  更新 Xray 核心（不带参数在线下载，带参数用离线包）
 #   des update             更新 des 脚本
 #   des uninstall          卸载
 #
@@ -24,7 +24,9 @@
 #   GH_PROXY=https://ghfast.top/    GitHub 下载代理前缀（可选；直连失败时会自动尝试内置镜像）
 #   XRAY_VERSION=v26.x.x            指定 Xray 版本（默认 latest）
 #   DES_URL=<raw 地址>              des 脚本更新地址
-#   也可把 Xray-linux-<arch>.zip 预先放到 /root/ 离线安装
+#   XRAY_ZIP=/path/Xray-linux-64.zip  指定离线包
+#   安装时优先使用本地离线包：脚本目录 / 当前目录 / /root / /tmp 下的
+#   Xray-linux-<arch>.zip（同目录有 .dgst 时校验 SHA256）或 xray 二进制
 
 VERSION="1.0.0"
 BASE="/etc/des"
@@ -352,47 +354,87 @@ xray_arch() {
   esac
 }
 
+# 查找本地离线包：XRAY_ZIP > 脚本所在目录 > 当前目录 > /root > /tmp
+# 支持官方 zip（Xray-linux-<arch>.zip，旁边有 .dgst 时校验 SHA256）或已解压的 xray 二进制
+find_local_xray() {
+  local a d f dir
+  a=$(xray_arch)
+  [ -n "${XRAY_ZIP-}" ] && [ -f "$XRAY_ZIP" ] && { echo "$XRAY_ZIP"; return 0; }
+  dir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+  for d in "$dir" "$PWD" /root /tmp; do
+    [ "$d" = "/usr/local/bin" ] && continue
+    for f in "$d/Xray-linux-$a.zip" "$d/xray-linux-$a.zip" "$d/xray"; do
+      [ -f "$f" ] && [ -s "$f" ] && { echo "$f"; return 0; }
+    done
+  done
+  return 1
+}
+
+# install_xray [auto|online|文件路径]
+#   auto（默认）：优先本地离线包，没有再在线下载（GitHub → 镜像）
+#   online：只在线下载（des update-xray 默认）
 install_xray() {
-  local a z u dg s tmp
+  local mode="${1:-auto}" a z u dg s tmp src=""
   a=$(xray_arch); z="Xray-linux-$a.zip"
-  need_pkgs unzip:unzip
   # 用磁盘临时目录，避免 /tmp 为 tmpfs 时占用 128MB 内存
   tmp="$BASE/.tmp"; rm -rf "$tmp"; mkdir -p "$tmp"
-  if [ -f "/root/$z" ]; then
-    info "使用本地 /root/$z"
-    cp -f "/root/$z" "$tmp/x.zip"; dg=""
+  dg=""
+
+  case "$mode" in
+    auto)   src=$(find_local_xray) ;;
+    online) src="" ;;
+    *)      [ -f "$mode" ] || { err "找不到离线包 $mode"; return 1; }; src="$mode" ;;
+  esac
+
+  if [ -n "$src" ]; then
+    info "使用本地离线包 $src"
+    if [ -f "$src.dgst" ]; then
+      dg=$(awk -F'= *' '/^SHA2-256/{print $2; exit}' "$src.dgst" | tr -d '\r ')
+    fi
+    case "$src" in
+      *.zip) cp -f "$src" "$tmp/x.zip" ;;
+      *)     cp -f "$src" "$tmp/xray" ;;
+    esac
   else
     if [ "$XRAY_VERSION" = "latest" ]; then
       u="https://github.com/XTLS/Xray-core/releases/latest/download/$z"
     else
       u="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/$z"
     fi
-    info "下载 Xray ($XRAY_VERSION / $a) ..."
-    gh_get "$u" "$tmp/x.zip" progress || { rm -rf "$tmp"; err "Xray 下载失败（可把 $z 上传到 /root/ 离线安装）"; return 1; }
-    dg=""
+    info "在线下载 Xray ($XRAY_VERSION / $a) ..."
+    gh_get "$u" "$tmp/x.zip" progress || {
+      rm -rf "$tmp"
+      err "Xray 下载失败。可在能访问 GitHub 的电脑下载 $z（及 $z.dgst），上传到 /root/ 后重试"
+      return 1
+    }
     gh_get "$u.dgst" "$tmp/x.dgst" && dg=$(awk -F'= *' '/^SHA2-256/{print $2; exit}' "$tmp/x.dgst" | tr -d '\r ')
   fi
-  if [ -n "$dg" ]; then
-    s=$(sha256sum "$tmp/x.zip" | awk '{print $1}')
-    [ "$s" = "$dg" ] || { rm -rf "$tmp"; err "SHA256 校验失败"; return 1; }
-    ok "SHA256 校验通过"
-  else
-    warn "未取得官方摘要，跳过 SHA256 校验"
+
+  if [ -f "$tmp/x.zip" ]; then
+    if [ -n "$dg" ]; then
+      s=$(sha256sum "$tmp/x.zip" | awk '{print $1}')
+      [ "$s" = "$dg" ] || { rm -rf "$tmp"; err "SHA256 校验失败"; return 1; }
+      ok "SHA256 校验通过"
+    else
+      warn "没有 .dgst 摘要文件，跳过 SHA256 校验"
+    fi
+    need_pkgs unzip:unzip
+    # 只解压 xray，不需要 geoip/geosite（配置中不引用 geodata）
+    unzip -oq "$tmp/x.zip" xray -d "$tmp" || { rm -rf "$tmp"; err "解压失败"; return 1; }
   fi
-  # 只解压 xray，不需要 geoip/geosite（配置中不引用 geodata）
-  unzip -oq "$tmp/x.zip" xray -d "$tmp" || { rm -rf "$tmp"; err "解压失败"; return 1; }
   chmod 755 "$tmp/xray"
-  "$tmp/xray" version >/dev/null 2>&1 || { rm -rf "$tmp"; err "Xray 无法运行"; return 1; }
+  "$tmp/xray" version >/dev/null 2>&1 || { rm -rf "$tmp"; err "Xray 无法运行（架构不符或文件损坏）"; return 1; }
   if [ -s "$XRAY_CONF" ] && ! "$tmp/xray" run -test -c "$XRAY_CONF" >/dev/null 2>&1; then
-    rm -rf "$tmp"; err "新版 Xray 不兼容现有配置，已放弃更新"; return 1
+    rm -rf "$tmp"; err "该 Xray 版本不兼容现有配置，已放弃"; return 1
   fi
   mv -f "$tmp/xray" "$XRAY_BIN.new" && mv -f "$XRAY_BIN.new" "$XRAY_BIN"
   rm -rf "$tmp"
   ok "Xray $("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}') 已安装"
 }
 
+# des update-xray [离线包路径]：不带参数时在线更新
 cmd_update_xray() {
-  install_xray || return 1
+  install_xray "${1:-online}" || return 1
   svc_running des-xray && svc_do restart des-xray
   return 0
 }
@@ -1237,7 +1279,7 @@ menu() {
       22) [ "$role" = "relay" ] && rps_menu ;;
       11) cmd_node; pause ;;
       7)  cmd_status; pause ;;
-      0)  cmd_update_xray ;;
+      0)  cmd_update_xray "$(find_local_xray 2>/dev/null)" ;;
       00) cmd_selfupdate ;;
       99) cmd_uninstall ;;
       q|Q) exit 0 ;;
@@ -1255,7 +1297,7 @@ main() {
     install)      check_env; lock; cmd_install ;;
     cert)         check_env; need_pkgs openssl:openssl jq:jq; lock; shift; cmd_cert "$@" ;;
     apply)        check_env; lock; apply && ok "已应用" ;;
-    update-xray)  check_env; lock; cmd_update_xray ;;
+    update-xray)  check_env; lock; shift; cmd_update_xray "${1-}" ;;
     update)       check_env; cmd_selfupdate ;;
     uninstall)    check_env; lock; cmd_uninstall ;;
     ''|menu)
