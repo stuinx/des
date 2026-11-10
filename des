@@ -1,0 +1,1105 @@
+#!/bin/sh
+# des: 独立的 Alpine 精简落地 / 中转脚本，可与 de_GWD client 配合使用
+# 针对 Alpine / OpenRC / 128MB NAT LXC
+#
+#   落地：VLESS + XHTTP + TLS 主线节点（de_GWD client 可直连）
+#         + 55 附加协议（Reality + Vision / SOCKS5）
+#   中转：44 端口转发（nftables 内核转发 / Xray 用户态，自动选择）
+#         + 22 RproxyS（Xray VLESS Reverse portal）
+#   证书：使用其他 server 生成的证书上传导入，本机不申请证书
+#
+# 用法：
+#   des                    交互菜单
+#   des install            安装 / 重新安装
+#   des cert CER KEY       导入 / 更新证书（可供远端 scp 后 ssh 调用）
+#   des node               打印节点信息
+#   des status             运行状态
+#   des apply              按状态文件重建配置并重启服务
+#   des refresh            刷新 nft 域名目标解析 + 日志截断（crond 每 5 分钟调用）
+#   des update-xray        更新 Xray 核心
+#   des update             更新 des 脚本
+#   des uninstall          卸载
+#
+# 环境变量：
+#   GH_PROXY=https://ghproxy.net/   GitHub 下载代理前缀（可选）
+#   XRAY_VERSION=v26.x.x            指定 Xray 版本（默认 latest）
+#   DES_URL=<raw 地址>              des 脚本更新地址
+#   也可把 Xray-linux-<arch>.zip 预先放到 /root/ 离线安装
+
+VERSION="1.0.0"
+BASE="/etc/des"
+STATE="$BASE/state.json"
+SSL_DIR="$BASE/ssl"
+CERT="$SSL_DIR/cert.pem"
+KEY="$SSL_DIR/key.pem"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONF="$BASE/xray.json"
+NFT_CONF="$BASE/nft.conf"
+XRAY_LOG="/var/log/des-xray.log"
+SELF="/usr/local/bin/des"
+DES_URL="${DES_URL:-https://raw.githubusercontent.com/stuinx/des/main/des}"
+GH_PROXY="${GH_PROXY:-}"
+XRAY_VERSION="${XRAY_VERSION:-latest}"
+NFT_OK=""
+
+if [ -t 1 ]; then
+  R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[36m'; W='\033[1m'; N='\033[0m'
+else
+  R=''; G=''; Y=''; B=''; W=''; N=''
+fi
+
+# ---------------------------------------------------------------- 基础工具
+
+say()  { printf '%b\n' "$*"; }
+ok()   { say "${G}[✓]${N} $*"; }
+info() { say "${B}[i]${N} $*"; }
+warn() { say "${Y}[!]${N} $*"; }
+err()  { say "${R}[✕]${N} $*" >&2; }
+die()  { err "$*"; exit 1; }
+line() { say "${B}--------------------------------------------------${N}"; }
+pause() { [ -t 0 ] && { printf '按回车继续...'; read -r __x; }; return 0; }
+
+# ask VAR "提示" [默认值]
+ask() {
+  local __a
+  if [ -n "${3-}" ]; then printf '%s [%s]: ' "$2" "$3"; else printf '%s: ' "$2"; fi
+  IFS= read -r __a || die "输入已结束"
+  __a=$(printf '%s' "$__a" | tr -d ' \t\r')
+  [ -z "$__a" ] && __a="${3-}"
+  eval "$1=\$__a"
+}
+
+confirm() {
+  local __c
+  printf '%s [y/N]: ' "$1"
+  read -r __c || return 1
+  case "$__c" in y|Y|yes|YES) return 0 ;; esac
+  return 1
+}
+
+is_port()   { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_ipv4()   { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+is_domain() { printf '%s' "$1" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'; }
+is_host()   { is_ipv4 "$1" || is_domain "$1"; }
+is_uuid()   { printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'; }
+is_path()   { printf '%s' "$1" | grep -Eq '^/[A-Za-z0-9._~/-]{1,64}$'; }
+
+lock() {
+  mkdir -p "$BASE" && chmod 700 "$BASE"
+  exec 9>"$BASE/.lock"
+  if command -v flock >/dev/null 2>&1; then
+    if ! flock -n 9; then
+      [ "${1-}" = "quiet" ] && exit 0
+      die "另一个 des 实例正在运行"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------- 状态文件
+
+st_get()  { jq -r "($1) // empty" "$STATE" 2>/dev/null; }
+st_true() { jq -e "($1) == true" "$STATE" >/dev/null 2>&1; }
+
+# st_set 'jq 过滤器' [--arg/--argjson ...]
+st_set() {
+  local f="$1" t="$STATE.tmp.$$"
+  shift
+  if jq "$@" "$f" "$STATE" >"$t" 2>/dev/null && [ -s "$t" ]; then
+    chmod 600 "$t" && mv -f "$t" "$STATE"
+  else
+    rm -f "$t"; err "状态写入失败"; return 1
+  fi
+}
+
+txn_begin() { cp -f "$STATE" "$STATE.txn"; }
+txn_commit() {
+  if apply; then rm -f "$STATE.txn"; return 0; fi
+  err "应用失败，已回滚到修改前的配置"
+  mv -f "$STATE.txn" "$STATE"
+  apply >/dev/null 2>&1
+  return 1
+}
+
+# ---------------------------------------------------------------- 环境
+
+check_env() {
+  [ "$(id -u)" = "0" ] || die "需要 root 权限"
+  command -v apk >/dev/null 2>&1 || die "本脚本仅支持 Alpine Linux"
+  command -v rc-service >/dev/null 2>&1 || die "未检测到 OpenRC（rc-service）"
+}
+
+# need_pkgs 命令:包名 ...
+need_pkgs() {
+  local x m=""
+  for x in "$@"; do
+    command -v "${x%%:*}" >/dev/null 2>&1 || m="$m ${x#*:}"
+  done
+  [ -f /etc/ssl/certs/ca-certificates.crt ] || m="$m ca-certificates"
+  [ -z "$m" ] && return 0
+  info "安装依赖:$m"
+  # shellcheck disable=SC2086
+  apk add --no-cache $m >/dev/null 2>&1 || { apk update >/dev/null 2>&1; apk add --no-cache $m >/dev/null 2>&1; } \
+    || die "依赖安装失败:$m"
+}
+
+mem_mb() {
+  local t f c
+  t=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
+  for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    [ -r "$f" ] || continue
+    c=$(cat "$f" 2>/dev/null)
+    case "$c" in ''|max|*[!0-9]*) continue ;; esac
+    c=$((c / 1048576))
+    [ "$c" -gt 0 ] && [ "$c" -lt "$t" ] && t=$c
+  done
+  echo "$t"
+}
+
+gomemlimit() {
+  local g
+  g=$(( $(mem_mb) * 35 / 100 ))
+  [ "$g" -lt 24 ] && g=24
+  [ "$g" -gt 256 ] && g=256
+  echo "${g}MiB"
+}
+
+pub_ipv4() {
+  local u i
+  for u in https://api.ipify.org https://ip.sb https://ifconfig.me; do
+    i=$(curl -4 -fs --max-time 5 "$u" 2>/dev/null | tr -d ' \r\n')
+    is_ipv4 "$i" && { echo "$i"; return 0; }
+  done
+  return 1
+}
+
+resolve4() {
+  local r
+  is_ipv4 "$1" && { echo "$1"; return 0; }
+  r=$(getent hosts "$1" 2>/dev/null | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
+  [ -z "$r" ] && r=$(nslookup "$1" 2>/dev/null | awk '/^Name:/{f=1} f' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+  [ -n "$r" ] && { echo "$r"; return 0; }
+  return 1
+}
+
+port_in_state() {
+  [ -f "$STATE" ] || return 1
+  jq -e --argjson p "$1" '
+    [ .landing.listen_port?,
+      (.extras // {} | .[] | .listen_port?),
+      (.relay.forwards[]? | .listen),
+      (if .relay.rproxys.enabled? == true then .relay.rproxys.listen_port else empty end),
+      (if .relay.rproxys.enabled? == true then (.relay.rproxys.mappings[]? | .port) else empty end)
+    ] | any(.[]; . == $p)' "$STATE" >/dev/null 2>&1
+}
+
+port_listening() {
+  { netstat -lntu 2>/dev/null || ss -lntu 2>/dev/null; } | awk '{print $4, $5}' | grep -Eq "[:.]$1( |\$)"
+}
+
+# ask_port VAR "提示" [默认] [允许保持的当前端口]
+ask_port() {
+  local __pp
+  while :; do
+    ask __pp "$2" "${3-}"
+    is_port "$__pp" || { err "端口无效"; continue; }
+    if [ "$__pp" != "${4-}" ]; then
+      port_in_state "$__pp" && { err "端口 $__pp 已被 des 其他功能占用"; continue; }
+      port_listening "$__pp" && { err "端口 $__pp 已被其他程序监听"; continue; }
+    fi
+    break
+  done
+  eval "$1=\$__pp"
+}
+
+# ask_pub VAR "提示" 默认
+ask_pub() {
+  local __pb
+  while :; do
+    ask __pb "$2" "$3"
+    is_port "$__pb" && break
+    err "端口无效"
+  done
+  eval "$1=\$__pb"
+}
+
+ask_proto() {
+  local __x
+  say "  1) TCP（de_GWD 主线 XHTTP 只需 TCP）  2) TCP+UDP  3) UDP"
+  ask __x "协议" "1"
+  case "$__x" in 2) __x="tcp,udp" ;; 3) __x="udp" ;; *) __x="tcp" ;; esac
+  eval "$1=\$__x"
+}
+
+new_uuid() { "$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
+
+svc_running() { rc-service "$1" status >/dev/null 2>&1; }
+svc_state() {
+  if [ ! -f "/etc/init.d/$1" ]; then printf '%b' "${W}-${N}"
+  elif svc_running "$1"; then printf '%b' "${G}运行中${N}"
+  else printf '%b' "${R}停止${N}"; fi
+}
+
+addr_of() { if [ "$2" = "443" ]; then echo "$1"; else echo "$1:$2"; fi; }
+
+# ---------------------------------------------------------------- nftables 能力探测
+
+nft_usable() {
+  [ -n "$NFT_OK" ] && { [ "$NFT_OK" = "1" ]; return; }
+  NFT_OK=0
+  command -v nft >/dev/null 2>&1 || apk add --no-cache nftables >/dev/null 2>&1 || return 1
+  nft add table ip des_probe 2>/dev/null || return 1
+  if ! nft add chain ip des_probe p '{ type nat hook prerouting priority -100; }' 2>/dev/null; then
+    nft delete table ip des_probe 2>/dev/null; return 1
+  fi
+  nft delete table ip des_probe 2>/dev/null
+  if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || return 1
+    [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] || return 1
+  fi
+  NFT_OK=1
+  return 0
+}
+
+# ---------------------------------------------------------------- Xray 安装
+
+xray_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo 64 ;;
+    aarch64|arm64) echo arm64-v8a ;;
+    armv7*)        echo arm32-v7a ;;
+    *) die "不支持的架构 $(uname -m)" ;;
+  esac
+}
+
+install_xray() {
+  local a z u dg s tmp
+  a=$(xray_arch); z="Xray-linux-$a.zip"
+  # 用磁盘临时目录，避免 /tmp 为 tmpfs 时占用 128MB 内存
+  tmp="$BASE/.tmp"; rm -rf "$tmp"; mkdir -p "$tmp"
+  if [ -f "/root/$z" ]; then
+    info "使用本地 /root/$z"
+    cp -f "/root/$z" "$tmp/x.zip"; dg=""
+  else
+    if [ "$XRAY_VERSION" = "latest" ]; then
+      u="https://github.com/XTLS/Xray-core/releases/latest/download/$z"
+    else
+      u="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/$z"
+    fi
+    info "下载 Xray ($XRAY_VERSION / $a) ..."
+    curl -fL --retry 3 --connect-timeout 10 -o "$tmp/x.zip" "${GH_PROXY}$u" || { rm -rf "$tmp"; err "Xray 下载失败"; return 1; }
+    dg=$(curl -fsL --retry 3 --connect-timeout 10 "${GH_PROXY}$u.dgst" 2>/dev/null | awk -F'= *' '/^SHA2-256/{print $2; exit}' | tr -d '\r ')
+  fi
+  if [ -n "$dg" ]; then
+    s=$(sha256sum "$tmp/x.zip" | awk '{print $1}')
+    [ "$s" = "$dg" ] || { rm -rf "$tmp"; err "SHA256 校验失败"; return 1; }
+    ok "SHA256 校验通过"
+  else
+    warn "未取得官方摘要，跳过 SHA256 校验"
+  fi
+  # 只解压 xray，不需要 geoip/geosite（配置中不引用 geodata）
+  unzip -oq "$tmp/x.zip" xray -d "$tmp" || { rm -rf "$tmp"; err "解压失败"; return 1; }
+  chmod 755 "$tmp/xray"
+  "$tmp/xray" version >/dev/null 2>&1 || { rm -rf "$tmp"; err "Xray 无法运行"; return 1; }
+  if [ -s "$XRAY_CONF" ] && ! "$tmp/xray" run -test -c "$XRAY_CONF" >/dev/null 2>&1; then
+    rm -rf "$tmp"; err "新版 Xray 不兼容现有配置，已放弃更新"; return 1
+  fi
+  mv -f "$tmp/xray" "$XRAY_BIN.new" && mv -f "$XRAY_BIN.new" "$XRAY_BIN"
+  rm -rf "$tmp"
+  ok "Xray $("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}') 已安装"
+}
+
+cmd_update_xray() {
+  install_xray || return 1
+  svc_running des-xray && rc-service des-xray restart >/dev/null 2>&1
+  return 0
+}
+
+# ---------------------------------------------------------------- OpenRC 服务
+
+write_services() {
+  local hn
+  hn=$(ulimit -Hn 2>/dev/null)
+  case "$hn" in unlimited) hn=65535 ;; ''|*[!0-9]*) hn=4096 ;; esac
+  [ "$hn" -gt 65535 ] && hn=65535
+
+  cat >/etc/init.d/des-xray <<'EOF'
+#!/sbin/openrc-run
+name="des-xray"
+description="des Xray"
+supervisor="supervise-daemon"
+command="/usr/local/bin/xray"
+command_args="run -c /etc/des/xray.json"
+supervise_daemon_args="--env GOMEMLIMIT=${GOMEMLIMIT:-40MiB} --env GOGC=${GOGC:-50}"
+respawn_delay=3
+respawn_max=0
+output_log="/var/log/des-xray.log"
+error_log="/var/log/des-xray.log"
+
+depend() {
+	need net
+	after firewall des-nft
+}
+
+start_pre() {
+	checkpath -f -m 0640 /var/log/des-xray.log
+	/usr/local/bin/xray run -test -c /etc/des/xray.json >/dev/null 2>&1 || {
+		eerror "xray.json 校验失败"
+		return 1
+	}
+}
+EOF
+  cat >/etc/conf.d/des-xray <<EOF
+# 由 des 按内存上限自动生成（物理内存 / cgroup 上限的 35%）
+GOMEMLIMIT="$(gomemlimit)"
+GOGC="50"
+rc_ulimit="-n $hn"
+EOF
+
+  cat >/etc/init.d/des-nft <<'EOF'
+#!/sbin/openrc-run
+description="des nftables port forward"
+
+depend() {
+	need net
+	before des-xray
+}
+
+start() {
+	ebegin "Loading des nft rules"
+	sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	nft -f /etc/des/nft.conf
+	eend $?
+}
+
+stop() {
+	ebegin "Removing des nft rules"
+	nft delete table ip des >/dev/null 2>&1
+	eend 0
+}
+EOF
+  chmod 755 /etc/init.d/des-xray /etc/init.d/des-nft
+}
+
+setup_cron() {
+  touch /etc/crontabs/root
+  grep -qF "$SELF refresh" /etc/crontabs/root || echo "*/5 * * * * $SELF refresh >/dev/null 2>&1" >>/etc/crontabs/root
+  rc-update add crond default >/dev/null 2>&1
+  svc_running crond || rc-service crond start >/dev/null 2>&1
+  return 0
+}
+
+install_self() {
+  local src
+  src=$(readlink -f "$0" 2>/dev/null)
+  if [ -f "$src" ] && head -n1 "$src" 2>/dev/null | grep -q '^#!/bin/sh'; then
+    [ "$src" = "$SELF" ] || cp -f "$src" "$SELF"
+  else
+    curl -fsL "${GH_PROXY}$DES_URL" -o "$SELF" || warn "未能安装 $SELF，请手动下载"
+  fi
+  chmod 755 "$SELF" 2>/dev/null
+  return 0
+}
+
+cmd_selfupdate() {
+  curl -fsL "${GH_PROXY}$DES_URL" -o "$SELF.new" || { err "下载失败（可设置 DES_URL）"; return 1; }
+  if head -n1 "$SELF.new" | grep -q '^#!/bin/sh' && sh -n "$SELF.new"; then
+    chmod 755 "$SELF.new" && mv -f "$SELF.new" "$SELF"
+    ok "des 已更新到 $(awk -F'"' '/^VERSION=/{print $2; exit}' "$SELF")"
+  else
+    rm -f "$SELF.new"; err "下载内容校验失败"; return 1
+  fi
+}
+
+# ---------------------------------------------------------------- 证书
+
+cert_sans() {
+  openssl x509 -in "$1" -noout -text 2>/dev/null \
+    | awk '/Subject Alternative Name/{getline; print}' | tr ',' '\n' | sed -n 's/^ *DNS://p'
+}
+cert_cn() { openssl x509 -in "$1" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,/]*\).*/\1/p'; }
+cert_end() { openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2; }
+
+# cert_covers 证书 域名
+cert_covers() {
+  local d s
+  d=$(printf '%s' "$2" | tr 'A-Z' 'a-z')
+  for s in $(cert_sans "$1") $(cert_cn "$1"); do
+    s=$(printf '%s' "$s" | tr 'A-Z' 'a-z')
+    [ "$s" = "$d" ] && return 0
+    case "$s" in '*.'*) [ "${d#*.}" = "${s#\*.}" ] && return 0 ;; esac
+  done
+  return 1
+}
+
+cert_default_domain() {
+  local s
+  s=$(cert_sans "$CERT" | grep -v '^\*' | head -n1)
+  [ -z "$s" ] && s=$(cert_sans "$CERT" | head -n1 | sed 's/^\*\./des./')
+  echo "$s"
+}
+
+cmd_cert() {
+  local cer="${1-}" key="${2-}" p1 p2 d
+  if [ -z "$cer" ]; then
+    say "请先把其他 server 上的证书上传到本机，例如在 de_GWD server 上执行："
+    say "  ${Y}scp -P <LXC的SSH端口> /var/www/ssl/de_GWD.cer /var/www/ssl/de_GWD.key root@<LXC地址>:/root/${N}"
+    ask cer "证书（fullchain）路径" "/root/de_GWD.cer"
+    ask key "私钥路径" "/root/de_GWD.key"
+  fi
+  [ -f "$cer" ] || { err "找不到证书 $cer"; return 1; }
+  [ -f "$key" ] || { err "找不到私钥 $key"; return 1; }
+  if cmp -s "$cer" "$CERT" && cmp -s "$key" "$KEY"; then
+    ok "证书未变化（到期 $(cert_end "$CERT")），无需更新"; return 0
+  fi
+  openssl x509 -in "$cer" -noout 2>/dev/null || { err "证书格式无效"; return 1; }
+  p1=$(openssl x509 -in "$cer" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null)
+  p2=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl sha256 2>/dev/null)
+  { [ -n "$p1" ] && [ "$p1" = "$p2" ]; } || { err "证书与私钥不匹配"; return 1; }
+  openssl x509 -in "$cer" -noout -checkend 0 >/dev/null 2>&1 || { err "证书已过期"; return 1; }
+  openssl x509 -in "$cer" -noout -checkend 1209600 >/dev/null 2>&1 || warn "证书将在 14 天内到期"
+
+  if [ "$(openssl x509 -in "$cer" -noout -subject_hash)" = "$(openssl x509 -in "$cer" -noout -issuer_hash)" ]; then
+    warn "这是自签证书！de_GWD client（allowInsecure=false）将无法连接"
+    confirm "仍然导入?" || return 1
+  elif ! openssl verify -untrusted "$cer" "$cer" >/dev/null 2>&1; then
+    warn "证书链校验未通过（可能缺少中间证书，请上传 fullchain 文件）"
+  fi
+
+  mkdir -p "$SSL_DIR" && chmod 700 "$SSL_DIR"
+  cp -f "$cer" "$CERT.new" && cp -f "$key" "$KEY.new" && chmod 600 "$CERT.new" "$KEY.new" \
+    && mv -f "$CERT.new" "$CERT" && mv -f "$KEY.new" "$KEY" || { err "证书写入失败"; return 1; }
+
+  say "  SAN : $(cert_sans "$CERT" | tr '\n' ' ')"
+  say "  到期: $(cert_end "$CERT")"
+  if [ -f "$STATE" ]; then
+    for d in $(st_get '.domain') $(st_get '.relay.rproxys.domain'); do
+      cert_covers "$CERT" "$d" || warn "新证书不覆盖已配置的域名 $d"
+    done
+    svc_running des-xray && rc-service des-xray restart >/dev/null 2>&1
+  fi
+  ok "证书已导入 $CERT"
+}
+
+# ---------------------------------------------------------------- 渲染配置
+
+render_xray() {
+  jq --arg cer "$CERT" --arg key "$KEY" '
+def tlsset: {certificates: [{certificateFile: $cer, keyFile: $key}], alpn: ["h2", "http/1.1"], minVersion: "1.2"};
+def sniff: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true};
+def private: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+              "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10"];
+def base: {log: {access: "none", loglevel: "warning"},
+           outbounds: [{tag: "direct", protocol: "freedom"}, {tag: "block", protocol: "blackhole"}]};
+if .role == "landing" then
+  .landing as $l | (.extras // {}) as $x |
+  base + {
+    inbounds: (
+      [{tag: "main", protocol: "vless", listen: "0.0.0.0", port: $l.listen_port,
+        settings: {clients: [$l.uuids[] | {id: .}], decryption: "none"},
+        streamSettings: {network: "xhttp", xhttpSettings: {path: $l.path, mode: "auto"},
+                         security: "tls", tlsSettings: tlsset},
+        sniffing: sniff}]
+      + (if $x.reality then [$x.reality | {tag: "reality", protocol: "vless", listen: "0.0.0.0", port: .listen_port,
+          settings: {clients: [{id: .uuid, flow: "xtls-rprx-vision"}], decryption: "none"},
+          streamSettings: {network: "tcp", security: "reality",
+            realitySettings: {show: false, dest: .dest, xver: 0, serverNames: [.sni],
+                              privateKey: .private_key, shortIds: [.short_id]}},
+          sniffing: sniff}] else [] end)
+      + (if $x.socks then [$x.socks | {tag: "socks", protocol: "socks", listen: "0.0.0.0", port: .listen_port,
+          settings: {auth: "password", accounts: [{user: .user, pass: .pass}], udp: false}}] else [] end)
+    ),
+    routing: {domainStrategy: "AsIs", rules: [{type: "field", ip: private, outboundTag: "block"}]}
+  }
+else
+  (.relay // {}) as $r |
+  [$r.forwards[]? | select(.engine == "xray")] as $fx |
+  ($r.rproxys // {}) as $p |
+  (if $p.enabled == true then [$p.mappings[]?] else [] end) as $maps |
+  base + {
+    inbounds: (
+      [$fx[] | {tag: "fwd-\(.listen)", protocol: "dokodemo-door", listen: "0.0.0.0", port: .listen,
+        settings: {address: .target_host, port: .target_port, network: .proto}}]
+      + (if $p.enabled == true then [{tag: "rps-tunnel", protocol: "vless", listen: "0.0.0.0", port: $p.listen_port,
+          settings: {decryption: "none", clients: [$p.uuids[] | {id: ., reverse: {tag: "portal"}}]},
+          streamSettings: {network: "tcp", security: "tls",
+            tlsSettings: {certificates: [{certificateFile: $cer, keyFile: $key}], minVersion: "1.2"}}}] else [] end)
+      + [$maps[] | {tag: "rps-map-\(.port)", protocol: "dokodemo-door", listen: "0.0.0.0", port: .port,
+          settings: {address: "127.0.0.1", port: .port, network: .proto}}]
+    ),
+    routing: {rules: (if ($maps | length) > 0
+      then [{type: "field", inboundTag: [$maps[] | "rps-map-\(.port)"], outboundTag: "portal"}] else [] end)}
+  }
+end' "$STATE"
+}
+
+# 返回 0=已生成  3=没有 nft 规则  1=解析失败
+render_nft() {
+  local rules pre="" post="" l h tp pr ip p
+  rules=$(jq -r '.relay.forwards[]? | select(.engine == "nft") | "\(.listen) \(.target_host) \(.target_port) \(.proto)"' "$STATE" 2>/dev/null)
+  [ -z "$rules" ] && return 3
+  while read -r l h tp pr; do
+    [ -z "$l" ] && continue
+    ip=$(resolve4 "$h") || { err "无法解析 $h"; return 1; }
+    for p in $(echo "$pr" | tr ',' ' '); do
+      pre="${pre}        $p dport $l dnat to $ip:$tp
+"
+      post="${post}        ip daddr $ip $p dport $tp masquerade
+"
+    done
+  done <<EOF
+$rules
+EOF
+  printf 'table ip des\ndelete table ip des\ntable ip des {\n    chain prerouting {\n        type nat hook prerouting priority -100; policy accept;\n%s    }\n    chain postrouting {\n        type nat hook postrouting priority 100; policy accept;\n%s    }\n}\n' "$pre" "$post"
+}
+
+# ---------------------------------------------------------------- 应用配置
+
+xray_alive() {
+  sleep 1
+  pgrep -x xray >/dev/null 2>&1 || pgrep -f "$XRAY_BIN run" >/dev/null 2>&1
+}
+
+apply() {
+  local role n rc
+  [ -f "$STATE" ] || { err "尚未安装"; return 1; }
+  role=$(st_get '.role')
+
+  # --- Xray
+  render_xray >"$XRAY_CONF.new" 2>/dev/null || { rm -f "$XRAY_CONF.new"; err "生成 xray.json 失败"; return 1; }
+  n=$(jq '.inbounds | length' "$XRAY_CONF.new" 2>/dev/null)
+  if [ "${n:-0}" -gt 0 ]; then
+    if ! "$XRAY_BIN" run -test -c "$XRAY_CONF.new" >"$BASE/.xray-test.log" 2>&1; then
+      err "xray.json 校验失败："; tail -n 5 "$BASE/.xray-test.log" >&2
+      rm -f "$XRAY_CONF.new"; return 1
+    fi
+    [ -f "$XRAY_CONF" ] && cp -f "$XRAY_CONF" "$XRAY_CONF.bak"
+    mv -f "$XRAY_CONF.new" "$XRAY_CONF"; chmod 600 "$XRAY_CONF"
+    rc-update add des-xray default >/dev/null 2>&1
+    rc-service des-xray restart >/dev/null 2>&1 || rc-service des-xray start >/dev/null 2>&1
+    if ! xray_alive; then
+      err "Xray 启动失败，查看 $XRAY_LOG"; tail -n 5 "$XRAY_LOG" 2>/dev/null >&2
+      if [ -f "$XRAY_CONF.bak" ]; then mv -f "$XRAY_CONF.bak" "$XRAY_CONF"; rc-service des-xray restart >/dev/null 2>&1; fi
+      return 1
+    fi
+  else
+    rm -f "$XRAY_CONF.new"
+    rc-service des-xray stop >/dev/null 2>&1
+    rc-update del des-xray default >/dev/null 2>&1
+  fi
+
+  # --- nftables（中转）
+  if [ "$role" = "relay" ]; then
+    render_nft >"$NFT_CONF.new"; rc=$?
+    case "$rc" in
+      0)
+        if ! nft -c -f "$NFT_CONF.new" >"$BASE/.nft-test.log" 2>&1; then
+          err "nft 规则校验失败："; tail -n 5 "$BASE/.nft-test.log" >&2
+          rm -f "$NFT_CONF.new"; return 1
+        fi
+        mv -f "$NFT_CONF.new" "$NFT_CONF"
+        echo "net.ipv4.ip_forward = 1" >/etc/sysctl.d/99-des.conf
+        rc-update add des-nft default >/dev/null 2>&1
+        if svc_running des-nft; then nft -f "$NFT_CONF" || return 1
+        else rc-service des-nft start >/dev/null 2>&1 || { err "nft 规则加载失败"; return 1; }; fi
+        ;;
+      3)
+        rm -f "$NFT_CONF.new" "$NFT_CONF"
+        rc-service des-nft stop >/dev/null 2>&1
+        rc-update del des-nft default >/dev/null 2>&1
+        nft delete table ip des >/dev/null 2>&1
+        ;;
+      *) rm -f "$NFT_CONF.new"; return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+stop_all() {
+  rc-service des-xray stop >/dev/null 2>&1
+  rc-service des-nft stop >/dev/null 2>&1
+  nft delete table ip des >/dev/null 2>&1
+  return 0
+}
+
+# ---------------------------------------------------------------- 安装
+
+install_landing() {
+  local dom host lp pp uuid path
+  if [ -s "$CERT" ]; then
+    info "已有证书：$(cert_sans "$CERT" | tr '\n' ' ') 到期 $(cert_end "$CERT")"
+    confirm "重新导入证书?" && { cmd_cert || return 1; }
+  else
+    cmd_cert || return 1
+  fi
+  while :; do
+    ask dom "节点域名（SNI，须被证书覆盖）" "$(cert_default_domain)"
+    if is_domain "$dom" && cert_covers "$CERT" "$dom"; then break; fi
+    err "域名无效或不在证书范围内（SAN: $(cert_sans "$CERT" | tr '\n' ' ')）"
+  done
+  while :; do
+    ask host "client 连接地址（解析到本 NAT 公网 IP 的域名，或直接填公网 IP）" "$dom"
+    is_host "$host" && break; err "地址无效"
+  done
+  ask_port lp "本机监听端口（NAT 内网端口）"
+  ask_pub pp "对应的 NAT 公网端口" "$lp"
+  uuid=$(new_uuid)
+  while :; do ask uuid "UUID" "$uuid"; is_uuid "$uuid" && break; err "UUID 格式无效"; done
+  path="/${uuid%%-*}"
+  while :; do
+    ask path "XHTTP path" "$path"
+    case "$path" in /*) ;; *) path="/$path" ;; esac
+    is_path "$path" && break; err "path 只能包含 A-Z a-z 0-9 . _ ~ / -"
+  done
+
+  jq -n --arg dom "$dom" --arg host "$host" --argjson lp "$lp" --argjson pp "$pp" \
+    --arg uuid "$uuid" --arg path "$path" '
+    {version: 1, role: "landing", domain: $dom, public_host: $host,
+     landing: {listen_port: $lp, public_port: $pp, uuids: [$uuid], path: $path},
+     extras: {}}' >"$STATE" && chmod 600 "$STATE"
+}
+
+install_relay() {
+  local ip host
+  ip=$(pub_ipv4)
+  while :; do
+    ask host "中转公网地址（client 连接用，NAT 公网 IP 或解析到它的域名）" "$ip"
+    is_host "$host" && break; err "地址无效"
+  done
+  jq -n --arg host "$host" '
+    {version: 1, role: "relay", domain: "", public_host: $host,
+     relay: {forwards: [], rproxys: {enabled: false, domain: "", listen_port: 0, public_port: 0, uuids: [], mappings: []}}}' \
+    >"$STATE" && chmod 600 "$STATE"
+  if nft_usable; then
+    ok "nftables 可用：端口转发默认使用内核转发（不占用户态内存）"
+  else
+    warn "nftables 不可用（LXC 无 NET_ADMIN 或不能开启 ip_forward），端口转发将使用 Xray 用户态"
+  fi
+  return 0
+}
+
+cmd_install() {
+  local r
+  check_env
+  need_pkgs curl:curl jq:jq openssl:openssl
+  if [ -f "$STATE" ]; then
+    warn "已存在配置（角色: $(st_get '.role')）"
+    confirm "重新安装将覆盖现有节点配置，继续?" || return 0
+    stop_all
+    mv -f "$STATE" "$STATE.old"
+    info "旧配置已备份到 $STATE.old"
+  fi
+  say "选择本机角色："
+  say "  1) 落地（生成 de_GWD client 可连接的主线节点 + 55）"
+  say "  2) 中转（44 端口转发 + 22 RproxyS）"
+  ask r "选择" "1"
+  mkdir -p "$BASE" && chmod 700 "$BASE"
+  [ -x "$XRAY_BIN" ] || install_xray || return 1
+  write_services
+  setup_cron
+  install_self
+  case "$r" in
+    2) install_relay || return 1 ;;
+    *) install_landing || return 1 ;;
+  esac
+  apply || { err "安装未完成，修正后可运行 des apply"; return 1; }
+  ok "安装完成，以后输入 des 打开菜单"
+  if [ "$r" = "2" ]; then
+    confirm "现在添加端口转发规则?" && fwd_add
+  fi
+  cmd_node
+}
+
+cmd_uninstall() {
+  local s
+  confirm "确认卸载 des（删除配置、Xray 与证书）?" || return 0
+  for s in des-xray des-nft; do
+    rc-service "$s" stop >/dev/null 2>&1
+    rc-update del "$s" default >/dev/null 2>&1
+    rm -f "/etc/init.d/$s" "/etc/conf.d/$s"
+  done
+  nft delete table ip des >/dev/null 2>&1
+  sed -i "\#$SELF refresh#d" /etc/crontabs/root 2>/dev/null
+  rm -rf "$BASE" "$XRAY_BIN" "$XRAY_LOG" /etc/sysctl.d/99-des.conf
+  rm -f "$SELF"
+  ok "已卸载"
+  exit 0
+}
+
+# ---------------------------------------------------------------- 落地：主节点 / 55
+
+main_menu_landing() {
+  local c u p h pp
+  while :; do
+    line
+    say "${G}主节点（VLESS + XHTTP + TLS）${N}"
+    say "  UUID: $(st_get '.landing.uuids | join(" ")')"
+    say "  path: $(st_get '.landing.path')    地址: $(addr_of "$(st_get '.public_host')" "$(st_get '.landing.public_port')")"
+    say " 1. 添加 UUID    2. 删除 UUID    3. 修改 path    4. 修改 client 连接地址 / NAT 公网端口    0. 返回"
+    ask c "选择" "0"
+    case "$c" in
+      1)
+        u=$(new_uuid); ask u "新 UUID" "$u"
+        is_uuid "$u" || { err "UUID 无效"; continue; }
+        txn_begin; st_set '.landing.uuids += [$u] | .landing.uuids |= unique' --arg u "$u" && txn_commit && ok "已添加"
+        ;;
+      2)
+        [ "$(st_get '.landing.uuids | length')" -le 1 ] && { err "至少保留一个 UUID"; continue; }
+        ask u "要删除的 UUID"
+        txn_begin; st_set '.landing.uuids -= [$u]' --arg u "$u" && txn_commit && ok "已删除"
+        ;;
+      3)
+        ask p "新 path" "$(st_get '.landing.path')"
+        case "$p" in /*) ;; *) p="/$p" ;; esac
+        is_path "$p" || { err "path 无效"; continue; }
+        txn_begin; st_set '.landing.path = $p' --arg p "$p" && txn_commit && ok "已修改，client 节点 path 需同步修改"
+        ;;
+      4)
+        ask h "client 连接地址" "$(st_get '.public_host')"; is_host "$h" || { err "地址无效"; continue; }
+        ask_pub pp "NAT 公网端口" "$(st_get '.landing.public_port')"
+        st_set '.public_host = $h | .landing.public_port = $pp' --arg h "$h" --argjson pp "$pp" && ok "已修改（仅影响节点信息显示）"
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+reality_setup() {
+  local cur lp pp sni dest keys pri pub uuid sid
+  cur=$(st_get '.extras.reality.listen_port')
+  ask_port lp "Reality 本机监听端口" "$cur" "$cur"
+  pp=$(st_get '.extras.reality.public_port')
+  ask_pub pp "对应的 NAT 公网端口" "${pp:-$lp}"
+  ask sni "SNI（伪装域名）" "$(st_get '.domain')"
+  ask dest "dest（回落目标）" "127.0.0.1:$(st_get '.landing.listen_port')"
+  keys=$("$XRAY_BIN" x25519 2>/dev/null | tr -d '\r')
+  pri=$(printf '%s\n' "$keys" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
+  pub=$(printf '%s\n' "$keys" | awk -F': *' 'tolower($1) ~ /^(public ?key|password)/ {print $2; exit}')
+  { [ -n "$pri" ] && [ -n "$pub" ]; } || { err "生成 x25519 密钥失败"; return 1; }
+  uuid=$(new_uuid); sid=$(openssl rand -hex 8)
+  txn_begin
+  st_set '.extras.reality = {listen_port: $lp, public_port: $pp, uuid: $u, sni: $sni, dest: $dest,
+          private_key: $pri, public_key: $pub, short_id: $sid}' \
+    --argjson lp "$lp" --argjson pp "$pp" --arg u "$uuid" --arg sni "$sni" --arg dest "$dest" \
+    --arg pri "$pri" --arg pub "$pub" --arg sid "$sid" && txn_commit && ok "Reality 已启用" && show_extras
+}
+
+socks_setup() {
+  local cur lp pp user pass
+  cur=$(st_get '.extras.socks.listen_port')
+  ask_port lp "SOCKS5 本机监听端口" "$cur" "$cur"
+  ask_pub pp "对应的 NAT 公网端口" "$lp"
+  ask user "用户名" "$(openssl rand -hex 4)"
+  ask pass "密码" "$(openssl rand -hex 12)"
+  txn_begin
+  st_set '.extras.socks = {listen_port: $lp, public_port: $pp, user: $user, pass: $pass}' \
+    --argjson lp "$lp" --argjson pp "$pp" --arg user "$user" --arg pass "$pass" && txn_commit && ok "SOCKS5 已启用" && show_extras
+}
+
+show_extras() {
+  local host x
+  host=$(st_get '.public_host')
+  x=$(st_get '.extras.reality.uuid')
+  if [ -n "$x" ]; then
+    line; say "${G}[55] VLESS + TCP + Reality + Vision${N}"
+    say "vless://$x@$host:$(st_get '.extras.reality.public_port')?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(st_get '.extras.reality.sni')&fp=chrome&pbk=$(st_get '.extras.reality.public_key')&sid=$(st_get '.extras.reality.short_id')&type=tcp#des-reality"
+  fi
+  x=$(st_get '.extras.socks.user')
+  if [ -n "$x" ]; then
+    line; say "${G}[55] SOCKS5${N}"
+    say "socks5://$x:$(st_get '.extras.socks.pass')@$host:$(st_get '.extras.socks.public_port')"
+  fi
+  return 0
+}
+
+extras_menu() {
+  local c
+  while :; do
+    line
+    say "${G}55. 附加协议${N}"
+    say " 1. VLESS + TCP + Reality + Vision  [$( [ -n "$(st_get '.extras.reality.uuid')" ] && printf '%b' "${G}已启用 :$(st_get '.extras.reality.listen_port')${N}" || printf '未启用')]"
+    say " 2. SOCKS5                          [$( [ -n "$(st_get '.extras.socks.user')" ] && printf '%b' "${G}已启用 :$(st_get '.extras.socks.listen_port')${N}" || printf '未启用')]"
+    say " 3. 停用 Reality    4. 停用 SOCKS5    5. 查看附加节点    0. 返回"
+    ask c "选择" "0"
+    case "$c" in
+      1) reality_setup ;;
+      2) socks_setup ;;
+      3) txn_begin; st_set 'del(.extras.reality)' && txn_commit && ok "Reality 已停用" ;;
+      4) txn_begin; st_set 'del(.extras.socks)' && txn_commit && ok "SOCKS5 已停用" ;;
+      5) show_extras; pause ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- 中转：44 端口转发
+
+fwd_list() {
+  local n
+  n=$(st_get '.relay.forwards | length'); [ -z "$n" ] && n=0
+  if [ "$n" -eq 0 ]; then say "  （暂无规则）"; return 0; fi
+  jq -r '.relay.forwards[] | "  :\(.listen) (公网 :\(.public))  ->  \(.target_host):\(.target_port)  [\(.proto)] [\(.engine)]"' "$STATE"
+}
+
+fwd_hint() {
+  local addr
+  addr=$(addr_of "$(st_get '.public_host')" "$1")
+  say "  de_GWD client 节点页：domain 填 ${Y}$addr${N}"
+  if is_domain "$2"; then
+    say "                        tls  填 ${Y}$2${N}（落地证书域名）；UUID / path 与落地相同"
+  else
+    say "                        tls  填 ${Y}落地证书域名${N}；UUID / path 与落地相同"
+  fi
+}
+
+fwd_add() {
+  local lp pp t h tp pr e def
+  ask_port lp "本机监听端口（NAT 内网端口）"
+  ask_pub pp "对应的 NAT 公网端口" "$lp"
+  while :; do
+    ask t "目标 地址:端口（如 land.example.com:20001）"
+    case "$t" in *:*) h="${t%:*}"; tp="${t##*:}" ;; *) h="$t"; tp=443 ;; esac
+    is_host "$h" && is_port "$tp" && break
+    err "目标无效（支持 IPv4 或域名）"
+  done
+  ask_proto pr
+  if nft_usable; then def=1; else def=2; fi
+  say "  1) nftables 内核转发（零内存、性能最好）  2) Xray 用户态（域名每次连接实时解析）"
+  ask e "转发引擎" "$def"
+  if [ "$e" = "1" ]; then
+    nft_usable || { err "本机 nftables 不可用，请选 2"; return 1; }
+    e="nft"
+  else
+    e="xray"
+  fi
+  txn_begin
+  st_set '.relay.forwards += [{listen: $lp, public: $pp, target_host: $h, target_port: $tp, proto: $pr, engine: $e}]' \
+    --argjson lp "$lp" --argjson pp "$pp" --arg h "$h" --argjson tp "$tp" --arg pr "$pr" --arg e "$e" \
+    && txn_commit && ok "已添加 :$lp -> $h:$tp" && fwd_hint "$pp" "$h"
+}
+
+fwd_del() {
+  local p
+  fwd_list
+  ask p "要删除的本机监听端口"
+  is_port "$p" || return 0
+  txn_begin
+  st_set '.relay.forwards |= map(select(.listen != $p))' --argjson p "$p" && txn_commit && ok "已删除 :$p"
+}
+
+fwd_menu() {
+  local c st
+  while :; do
+    if nft_usable; then st="可用"; else st="不可用"; fi
+    line
+    say "${G}44. 端口转发${N}（nftables: $st）"
+    fwd_list
+    say " 1. 添加规则    2. 删除规则    3. 立即刷新域名解析    0. 返回"
+    ask c "选择" "0"
+    case "$c" in
+      1) fwd_add ;;
+      2) fwd_del ;;
+      3) apply && ok "已刷新" ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- 中转：22 RproxyS
+
+rps_setup() {
+  local d cur lp pp u
+  [ -s "$CERT" ] || { warn "RproxyS 需要证书（RproxyC 不允许跳过证书校验）"; cmd_cert || return 1; }
+  while :; do
+    d=$(st_get '.relay.rproxys.domain'); [ -z "$d" ] && d=$(cert_default_domain)
+    ask d "RproxyS 隧道域名（须被证书覆盖，并解析到本中转 NAT 公网 IP）" "$d"
+    if is_domain "$d" && cert_covers "$CERT" "$d"; then break; fi
+    err "域名无效或不在证书范围内（SAN: $(cert_sans "$CERT" | tr '\n' ' ')）"
+  done
+  cur=$(st_get '.relay.rproxys | select(.enabled == true) | .listen_port')
+  ask_port lp "隧道监听端口（NAT 内网端口）" "${cur:-20000}" "$cur"
+  ask_pub pp "对应的 NAT 公网端口" "$lp"
+  u=$(st_get '.relay.rproxys.uuids[0]'); [ -z "$u" ] && u=$(new_uuid)
+  while :; do ask u "隧道 UUID" "$u"; is_uuid "$u" && break; err "UUID 无效"; done
+  txn_begin
+  st_set '.relay.rproxys |= (. + {enabled: true, domain: $d, listen_port: $lp, public_port: $pp, uuids: [$u]})' \
+    --arg d "$d" --argjson lp "$lp" --argjson pp "$pp" --arg u "$u" && txn_commit && ok "RproxyS 已启用" && rps_show
+}
+
+rps_add_map() {
+  local p pp pr
+  st_true '.relay.rproxys.enabled' || { err "请先启用 RproxyS"; return 1; }
+  ask_port p "映射端口（本机监听，同时作为 RproxyC 的 extPort）"
+  ask_pub pp "对应的 NAT 公网端口（外部访问用）" "$p"
+  ask_proto pr
+  txn_begin
+  st_set '.relay.rproxys.mappings += [{port: $p, public: $pp, proto: $pr}]' --argjson p "$p" --argjson pp "$pp" --arg pr "$pr" \
+    && txn_commit && ok "已添加映射 :$p"
+}
+
+rps_del_map() {
+  local p
+  ask p "要删除的映射端口"
+  is_port "$p" || return 0
+  txn_begin
+  st_set '.relay.rproxys.mappings |= map(select(.port != $p))' --argjson p "$p" && txn_commit && ok "已删除 :$p"
+}
+
+rps_show() {
+  st_true '.relay.rproxys.enabled' || { say "  RproxyS 未启用"; return 0; }
+  line; say "${G}[22] RproxyS（de_GWD client RproxyC 填写）${N}"
+  say "  隧道地址: ${Y}$(addr_of "$(st_get '.relay.rproxys.domain')" "$(st_get '.relay.rproxys.public_port')")${N}"
+  say "  隧道 UUID: ${Y}$(st_get '.relay.rproxys.uuids[0]')${N}"
+  jq -r --arg h "$(st_get '.public_host')" '.relay.rproxys.mappings[]? |
+    "  映射: extPort=\(.port) extProtocol=\(.proto)    外部访问 \($h):\(.public)"' "$STATE"
+}
+
+rps_menu() {
+  local c
+  while :; do
+    line
+    say "${G}22. RproxyS 反向代理${N}"
+    rps_show
+    say " 1. 启用 / 修改隧道    2. 添加映射端口    3. 删除映射端口    4. 停用 RproxyS    0. 返回"
+    ask c "选择" "0"
+    case "$c" in
+      1) rps_setup ;;
+      2) rps_add_map ;;
+      3) rps_del_map ;;
+      4) txn_begin; st_set '.relay.rproxys.enabled = false' && txn_commit && ok "RproxyS 已停用" ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- 节点 / 状态 / 刷新
+
+cmd_node() {
+  local role dom host pp path addr ep u
+  [ -f "$STATE" ] || { err "尚未安装"; return 1; }
+  role=$(st_get '.role')
+  host=$(st_get '.public_host')
+  if [ "$role" = "landing" ]; then
+    dom=$(st_get '.domain'); pp=$(st_get '.landing.public_port'); path=$(st_get '.landing.path')
+    addr=$(addr_of "$host" "$pp")
+    ep=$(printf '%s' "$path" | sed 's#/#%2F#g')
+    line
+    say "${G}de_GWD client 主线节点（VLESS + XHTTP + TLS）${N}"
+    say "  domain : ${Y}$addr${N}"
+    [ "$host" != "$dom" ] && say "  tls    : ${Y}$dom${N}   ← 在 client 节点页的 tls 按钮中填写"
+    say "  path   : ${Y}$path${N}"
+    for u in $(st_get '.landing.uuids[]'); do
+      say "  UUID   : ${Y}$u${N}"
+      say "  链接   : vless://$u@$host:$pp?encryption=none&security=tls&sni=$dom&alpn=h2&type=xhttp&path=$ep&mode=packet-up#des-$dom"
+    done
+    show_extras
+  else
+    line
+    say "${G}[44] 端口转发${N}   中转地址: $host"
+    fwd_list
+    jq -r '.relay.forwards[]? | "\(.public) \(.target_host)"' "$STATE" | while read -r pp u; do fwd_hint "$pp" "$u"; done
+    rps_show
+  fi
+  line
+}
+
+rss_mb() {
+  local t=0 p k
+  for p in $(pgrep -x "$1" 2>/dev/null); do
+    k=$(awk '/^VmRSS:/{print $2}' "/proc/$p/status" 2>/dev/null)
+    t=$((t + ${k:-0}))
+  done
+  echo $((t / 1024))
+}
+
+cmd_status() {
+  local role
+  role=$(st_get '.role')
+  line
+  say "des $VERSION    角色: ${Y}${role:-未安装}${N}    Xray: $("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')"
+  say "des-xray: $(svc_state des-xray) ($(rss_mb xray)MB)    des-nft: $(svc_state des-nft)    crond: $(svc_state crond)"
+  say "内存上限: $(mem_mb)MB    GOMEMLIMIT: $(awk -F'"' '/^GOMEMLIMIT=/{print $2}' /etc/conf.d/des-xray 2>/dev/null)"
+  free -m 2>/dev/null | awk 'NR<=2'
+  [ -s "$CERT" ] && say "证书: $(cert_sans "$CERT" | tr '\n' ' ')  到期 $(cert_end "$CERT")"
+  line
+}
+
+cmd_refresh() {
+  lock quiet
+  [ -f "$XRAY_LOG" ] && [ "$(wc -c <"$XRAY_LOG")" -gt 1048576 ] && : >"$XRAY_LOG"
+  [ -f "$STATE" ] || exit 0
+  [ "$(st_get '.role')" = "relay" ] || exit 0
+  render_nft >"$NFT_CONF.new" 2>/dev/null || { rm -f "$NFT_CONF.new"; exit 0; }
+  if cmp -s "$NFT_CONF.new" "$NFT_CONF"; then
+    rm -f "$NFT_CONF.new"
+  elif nft -c -f "$NFT_CONF.new" >/dev/null 2>&1; then
+    mv -f "$NFT_CONF.new" "$NFT_CONF" && nft -f "$NFT_CONF" && logger -t des "nft 转发目标解析已更新"
+  else
+    rm -f "$NFT_CONF.new"
+  fi
+  exit 0
+}
+
+# ---------------------------------------------------------------- 菜单
+
+menu() {
+  local role c
+  while :; do
+    role=$(st_get '.role')
+    say ""
+    say "${G}===================== des $VERSION =====================${N}"
+    say " 角色: ${Y}${role:-未安装}${N}    des-xray: $(svc_state des-xray)    des-nft: $(svc_state des-nft)"
+    [ -s "$CERT" ] && say " 证书到期: $(cert_end "$CERT")"
+    say "${G}====================================================${N}"
+    say " 1.  安装 / 重新安装（落地 / 中转）"
+    say " 3.  导入 / 更新 SSL 证书"
+    if [ "$role" = "landing" ]; then
+      say " 5.  主节点 UUID / path / 地址"
+      say " 55. 附加协议（Reality / SOCKS5）"
+    elif [ "$role" = "relay" ]; then
+      say " 44. 端口转发"
+      say " 22. RproxyS 反向代理"
+    fi
+    say " 11. 打印节点信息"
+    say " 7.  运行状态"
+    say " 0.  更新 Xray 核心      00. 更新 des 脚本"
+    say " 99. 卸载                q.  退出"
+    ask c "选择" "q"
+    case "$c" in
+      1)  cmd_install ;;
+      3)  cmd_cert ;;
+      5)  [ "$role" = "landing" ] && main_menu_landing ;;
+      55) [ "$role" = "landing" ] && extras_menu ;;
+      44) [ "$role" = "relay" ] && fwd_menu ;;
+      22) [ "$role" = "relay" ] && rps_menu ;;
+      11) cmd_node; pause ;;
+      7)  cmd_status; pause ;;
+      0)  cmd_update_xray ;;
+      00) cmd_selfupdate ;;
+      99) cmd_uninstall ;;
+      q|Q) exit 0 ;;
+      *)  err "无效选择" ;;
+    esac
+  done
+}
+
+main() {
+  case "${1-}" in
+    refresh)      cmd_refresh ;;
+    node)         cmd_node ;;
+    status)       cmd_status ;;
+    install)      check_env; lock; cmd_install ;;
+    cert)         check_env; need_pkgs openssl:openssl jq:jq; lock; shift; cmd_cert "$@" ;;
+    apply)        check_env; lock; apply && ok "已应用" ;;
+    update-xray)  check_env; lock; cmd_update_xray ;;
+    update)       check_env; cmd_selfupdate ;;
+    uninstall)    check_env; lock; cmd_uninstall ;;
+    ''|menu)
+      check_env; need_pkgs curl:curl jq:jq openssl:openssl; lock
+      [ -f "$STATE" ] || { info "尚未安装，进入安装流程"; cmd_install; }
+      menu ;;
+    -v|--version) echo "des $VERSION" ;;
+    *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  esac
+}
+
+main "$@"
